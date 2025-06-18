@@ -1,3 +1,5 @@
+import dotenv
+dotenv.load_dotenv()
 from fastapi import FastAPI, HTTPException, File, UploadFile, Request, Query, Depends, Response
 from pydantic import BaseModel
 from typing import List, Optional
@@ -14,6 +16,18 @@ import datetime
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer
+from langchain_community.embeddings import DashScopeEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_community.document_loaders import TextLoader, PDFPlumberLoader, Docx2txtLoader
+from langchain.chains import RetrievalQA
+from fastapi import File as FastAPIFile
+from langchain_community.vectorstores import FAISS
+from llm_utils import (
+    llm, DashScopeEmbeddings, parse_file, split_docs, ensure_str_docs, build_vector_store
+)
+
+
 
 app = FastAPI(title="DeepSeek Chat API")
 
@@ -156,91 +170,121 @@ async def summarize_messages(messages):
 @app.post("/chat")
 async def chat(request: Request, current_user: User = Depends(get_current_user)):
     req = await request.json()
-    print(req,'==========')  # 打印请求
-    # 检查是否有 session_id，没有则生成
+    print(req, '==========')  # 打印请求
     session_id = req.get("session_id")
     if not session_id or not isinstance(session_id, str) or len(session_id) < 8:
         session_id = str(uuid.uuid4())
-    user_id = current_user.username  # 用真实用户名
+    user_id = current_user.username
+    file_ids = req.get("file_ids")
     try:
-        # 查询历史消息，组装上下文
-        early_msgs, recent_msgs = await get_chat_history(session_id, limit=10)
-        summary = await summarize_messages(early_msgs)
-        context_msgs = []
-        if summary:
-            context_msgs.append(Message(role="system", content=summary))
-        for msg in recent_msgs:
-            context_msgs.append(Message(role=msg.role, content=msg.content))
-        # 加上本轮用户输入
-        context_msgs.append(Message(role="user", content=req["message"]))
-        messages = convert_messages(context_msgs)
-        print(messages, "messages")  # 打印消息
-        # 保存用户消息到数据库
-        async with AsyncSessionLocal() as db:
-            user_msg = ChatMessage(
-                session_id=session_id,
-                user_id=user_id,
-                role="user",
-                content=req["message"]
-            )
-            db.add(user_msg)
-            await db.commit()
-        if req.get("stream"):
-            # 流式响应
-            stream = llm.stream(messages)
-            async def generate():
-                async for chunk in stream:
-                    if chunk.content:
-                        # 保存AI消息到数据库
-                        async with AsyncSessionLocal() as db:
-                            ai_msg = ChatMessage(
-                                session_id=session_id,
-                                user_id=user_id,
-                                role="assistant",
-                                content=chunk.content
-                            )
-                            db.add(ai_msg)
-                            await db.commit()
-                        yield chunk.content
-            return generate()
-        else:
-            # 普通响应
-            response = llm.invoke(messages)
-            # 保存AI消息到数据库
+        if file_ids:
+            # ----------- RAG 多文件问答逻辑 -------------
+            all_docs = []
+            embeddings = DashScopeEmbeddings( model="text-embedding-v1", dashscope_api_key=os.environ["DASH_SCOPE_API_KEY"])
             async with AsyncSessionLocal() as db:
-                ai_msg = ChatMessage(
+                for file_id in file_ids:
+                    result = await db.execute(select(File).where(File.id == file_id, File.user_id == current_user.username))
+                    print(result, "result====")
+                    file_obj = result.scalar_one_or_none()
+                    if not file_obj:
+                        raise HTTPException(status_code=403, detail=f"无权访问文件 {file_id}")
+                    persist_path = f"vectorstores/{file_id}"
+                    vectorstore = FAISS.load_local(persist_path, embeddings, allow_dangerous_deserialization=True)
+                    retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
+                    docs = retriever.invoke(req["message"])
+                    print(docs, "docs====")
+                    all_docs.extend(docs)
+            unique_docs = {doc.page_content: doc for doc in all_docs}.values()
+            context = "\n".join([doc.page_content for doc in unique_docs])
+            prompt = f"以下是用户上传的多个文件内容片段：\n{context}\n\n用户问题：{req['message']}\n请基于文件内容作答。"
+            if req.get("stream"):
+                stream = llm.stream([HumanMessage(content=prompt)])
+                async def generate():
+                    async for chunk in stream:
+                        if chunk.content:
+                            yield chunk.content
+                return generate()
+            else:
+                response = llm.invoke([HumanMessage(content=prompt)])
+                return {
+                    "content": response.content,
+                    "sources": [doc.page_content for doc in unique_docs],
+                    "model": "deepseek-chat",
+                    "session_id": session_id
+                }
+        else:
+            # ----------- 普通对话逻辑 -------------
+            early_msgs, recent_msgs = await get_chat_history(session_id, limit=10)
+            summary = await summarize_messages(early_msgs)
+            context_msgs = []
+            if summary:
+                context_msgs.append(Message(role="system", content=summary))
+            for msg in recent_msgs:
+                context_msgs.append(Message(role=msg.role, content=msg.content))
+            context_msgs.append(Message(role="user", content=req["message"]))
+            messages = convert_messages(context_msgs)
+            print(messages, "messages")
+            async with AsyncSessionLocal() as db:
+                user_msg = ChatMessage(
                     session_id=session_id,
                     user_id=user_id,
-                    role="assistant",
-                    content=response.content
+                    role="user",
+                    content=req["message"]
                 )
-                db.add(ai_msg)
+                db.add(user_msg)
                 await db.commit()
-            return {
-                "response": response.content,
-                "model": "deepseek-chat",
-                "session_id": session_id
-            }
+            if req.get("stream"):
+                stream = llm.stream(messages)
+                async def generate():
+                    async for chunk in stream:
+                        if chunk.content:
+                            async with AsyncSessionLocal() as db:
+                                ai_msg = ChatMessage(
+                                    session_id=session_id,
+                                    user_id=user_id,
+                                    role="assistant",
+                                    content=chunk.content
+                                )
+                                db.add(ai_msg)
+                                await db.commit()
+                            yield chunk.content
+                return generate()
+            else:
+                response = llm.invoke(messages)
+                async with AsyncSessionLocal() as db:
+                    ai_msg = ChatMessage(
+                        session_id=session_id,
+                        user_id=user_id,
+                        role="assistant",
+                        content=response.content
+                    )
+                    db.add(ai_msg)
+                    await db.commit()
+                return {
+                    "content": response.content,
+                    "model": "deepseek-chat",
+                    "session_id": session_id
+                }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
-    try:
-        # 生成唯一文件id
-        file_id = str(uuid.uuid4())
-        # 获取文件扩展名
-        ext = file.filename.split(".")[-1] if "." in file.filename else "txt"
-        # 构造保存路径
-        save_path = f"uploads/{file_id}.{ext}"
-        # 确保 uploads 目录存在
-        os.makedirs("uploads", exist_ok=True)
-        # 保存文件
-        with open(save_path, "wb") as f:
-            f.write(await file.read())
-        return {"file_id": file_id, "filename": file.filename}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.post("/upload")
+# async def upload_file(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
+#     try:
+#         # 生成唯一文件id
+#         file_id = str(uuid.uuid4())
+#         # 获取文件扩展名
+#         ext = file.filename.split(".")[-1] if "." in file.filename else "txt"
+#         # 构造保存路径
+#         save_path = f"uploads/{file_id}.{ext}"
+#         # 确保 uploads 目录存在
+#         os.makedirs("uploads", exist_ok=True)
+#         # 保存文件
+#         with open(save_path, "wb") as f:
+#             f.write(await file.read())
+#         return {"file_id": file_id, "filename": file.filename}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def read_root():
@@ -261,6 +305,7 @@ async def get_history(session_id: str = Query(...), limit: int = Query(20), curr
             result = await db.execute(
                 select(ChatMessage)
                 .where(ChatMessage.session_id == session_id)
+                .where(ChatMessage.user_id == current_user.username)
                 .order_by(asc(ChatMessage.timestamp))
                 .limit(limit)
             )
@@ -281,13 +326,14 @@ async def get_history(session_id: str = Query(...), limit: int = Query(20), curr
 async def get_sessions(current_user: User = Depends(get_current_user)):
     try:
         async with AsyncSessionLocal() as db:
-            # 查询所有不同的 session_id 及其最后活跃时间、消息数
             result = await db.execute(
                 select(
                     ChatMessage.session_id,
                     func.max(ChatMessage.timestamp).label("last_active"),
                     func.count(ChatMessage.id).label("message_count")
-                ).group_by(ChatMessage.session_id)
+                )
+                .where(ChatMessage.user_id == current_user.username)
+                .group_by(ChatMessage.session_id)
                 .order_by(func.max(ChatMessage.timestamp).desc())
             )
             session_rows = result.fetchall()
@@ -297,6 +343,7 @@ async def get_sessions(current_user: User = Depends(get_current_user)):
                 first_msg_result = await db.execute(
                     select(ChatMessage.content)
                     .where(ChatMessage.session_id == row.session_id)
+                    .where(ChatMessage.user_id == current_user.username)
                     .order_by(asc(ChatMessage.timestamp))
                     .limit(1)
                 )
@@ -348,6 +395,55 @@ async def login(user: UserCreate):
             raise HTTPException(status_code=400, detail="用户名或密码错误")
         access_token = create_access_token(data={"sub": user.username}, expires_delta=datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
         return {"access_token": access_token, "token_type": "bearer"}
+
+# 新增 File 表模型
+class File(Base):
+    __tablename__ = "file"
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(64), index=True)
+    filename = Column(String(256))
+    upload_time = Column(DateTime, default=datetime.datetime.utcnow)
+
+@app.post("/upload")
+async def upload_file_rag(file: UploadFile = FastAPIFile(...), current_user: User = Depends(get_current_user)):
+    try:
+        file_id = str(uuid.uuid4())
+        ext = file.filename.split(".")[-1] if "." in file.filename else "txt"
+        save_path = f"uploads/{file_id}.{ext}"
+        os.makedirs("uploads", exist_ok=True)
+        with open(save_path, "wb") as f:
+            f.write(await file.read())
+        # 解析、分块、embedding、入库
+        docs = parse_file(save_path)
+
+        docs = ensure_str_docs(docs)    
+
+        docs = split_docs(docs)
+
+        docs = ensure_str_docs(docs)
+
+        persist_path = f"vectorstores/{file_id}"
+        os.makedirs("vectorstores", exist_ok=True)
+        build_vector_store(docs, persist_path)
+        # 保存文件信息到数据库
+        async with AsyncSessionLocal() as db:
+            file_obj = File(
+                id=file_id,
+                user_id=current_user.username,
+                filename=file.filename
+            )
+            db.add(file_obj)
+            await db.commit()
+        return {"file_id": file_id, "filename": file.filename}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/my_files")
+async def my_files(current_user: User = Depends(get_current_user)):
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(File).where(File.user_id == current_user.username))
+        files = result.scalars().all()
+        return [{"file_id": f.id, "filename": f.filename, "upload_time": f.upload_time.isoformat()} for f in files]
 
 if __name__ == "__main__":
     import uvicorn
